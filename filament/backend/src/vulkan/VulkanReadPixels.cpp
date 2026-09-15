@@ -18,6 +18,7 @@
 
 #include "DataReshaper.h"
 #include "VulkanCommands.h"
+#include "VulkanContext.h"
 #include "VulkanHandles.h"
 #include "VulkanTexture.h"
 
@@ -35,18 +36,17 @@ using namespace bluevk;
 namespace filament::backend {
 
 using TaskHandler = VulkanReadPixels::TaskHandler;
-using WorkloadFunc = TaskHandler::WorkloadFunc;
-using OnCompleteFunc = TaskHandler::OnCompleteFunc;
+using Task = TaskHandler::Task;
 
 TaskHandler::TaskHandler()
     : mShouldStop(false),
       mThread(&TaskHandler::loop, this) {}
 
-void TaskHandler::post(WorkloadFunc&& workload, OnCompleteFunc&& oncomplete) {
+void TaskHandler::post(Task&& task) {
     assert_invariant(!mShouldStop);
     {
         utils::UniqueLock lock(mTaskQueueMutex);
-        mTaskQueue.push(std::make_pair(std::move(workload), std::move(oncomplete)));
+        mTaskQueue.push(std::move(task));
     }
     mHasTaskCondition.notify_one();
 }
@@ -57,14 +57,11 @@ void TaskHandler::drain() {
     utils::Mutex syncPointMutex;
     utils::Condition syncCondition;
     bool done = false;
-    post([] {},
-            [&syncPointMutex, &syncCondition, &done] {
-                {
-                    utils::UniqueLock lock(syncPointMutex);
-                    done = true;
-                    syncCondition.notify_one();
-                }
-            });
+    post([&syncPointMutex, &syncCondition, &done](bool) {
+        utils::UniqueLock lock(syncPointMutex);
+        done = true;
+        syncCondition.notify_one();
+    });
 
     utils::UniqueLock lock(syncPointMutex);
     syncCondition.wait(lock, [&done] { return done; });
@@ -88,70 +85,100 @@ void TaskHandler::loop() {
         if (mShouldStop) {
             break;
         }
-        auto [workload, oncomplete] = mTaskQueue.front();
+        Task task = std::move(mTaskQueue.front());
         mTaskQueue.pop();
         lock.unlock();
-        workload();
-        oncomplete();
+        task(true);
     }
 
-    // Clean-up: we still need to call oncomplete for clients to do clean-up.
+    // Clean-up: the tasks we did not run still own resources, so we need to give them a chance to
+    // release them.
     while (true) {
         utils::UniqueLock lock(mTaskQueueMutex);
         if (mTaskQueue.empty()) {
             break;
         }
-        auto [workload, oncomplete] = mTaskQueue.front();
+        Task task = std::move(mTaskQueue.front());
         mTaskQueue.pop();
         lock.unlock();
-        oncomplete();
+        task(false);
     }
 }
+
+VulkanReadPixels::VulkanReadPixels(VkDevice device, VulkanContext const& context,
+        uint32_t const graphicsQueueFamilyIndex, OnReadCompleteFunction&& onReadComplete)
+        : mDevice(device),
+          mContext(context),
+          mGraphicsQueueFamilyIndex(graphicsQueueFamilyIndex),
+          mOnReadComplete(std::move(onReadComplete)) {}
 
 void VulkanReadPixels::terminate() noexcept {
     assert_invariant(mDevice != VK_NULL_HANDLE);
     if (mCommandPool == VK_NULL_HANDLE) {
         return;
     }
-    vkDestroyCommandPool(mDevice, mCommandPool, VKALLOC);
-    mDevice = VK_NULL_HANDLE;
 
-    mTaskHandler->shutdown();
-    mTaskHandler.reset();
+    // The handler thread must be done with the requests' resources before we can destroy them and
+    // the pool the command buffers were allocated from.
+    if (mTaskHandler) {
+        mTaskHandler->shutdown();
+        mTaskHandler.reset();
+    }
+    gc();
+
+    vkDestroyCommandPool(mDevice, mCommandPool, VKALLOC);
+    mCommandPool = VK_NULL_HANDLE;
+    mDevice = VK_NULL_HANDLE;
 }
 
-VulkanReadPixels::VulkanReadPixels(VkDevice device)
-    : mDevice(device) {}
+void VulkanReadPixels::retire(Request const& request) {
+    utils::LockGuard const lock(mRetiredRequestsMutex);
+    mRetiredRequests.push_back(request);
+}
+
+void VulkanReadPixels::gc() {
+    std::vector<Request> requests;
+    {
+        utils::LockGuard const lock(mRetiredRequestsMutex);
+        if (mRetiredRequests.empty()) {
+            return;
+        }
+        std::swap(requests, mRetiredRequests);
+    }
+    // Destroy without the lock held; the handler thread must not have to wait on us.
+    for (auto const& request: requests) {
+        vkDestroyBuffer(mDevice, request.stagingBuffer, VKALLOC);
+        vkFreeMemory(mDevice, request.stagingMemory, VKALLOC);
+        vkDestroyFence(mDevice, request.fence, VKALLOC);
+        vkFreeCommandBuffers(mDevice, mCommandPool, 1, &request.cmdbuffer);
+    }
+}
 
 void VulkanReadPixels::run(fvkmemory::resource_ptr<VulkanRenderTarget> srcTarget, uint32_t const x,
         uint32_t const y, uint32_t const width, uint32_t const height,
-        uint32_t const graphicsQueueFamilyIndex, PixelBufferDescriptor&& pbd,
-        SelecteMemoryFunction const& selectMemoryFunc,
-        OnReadCompleteFunction const& readCompleteFunc) {
+        PixelBufferDescriptor&& pbd) {
     bool const isDepthStencil = pbd.format == PixelDataFormat::DEPTH_COMPONENT ||
                          pbd.format == PixelDataFormat::DEPTH_STENCIL;
     VulkanAttachment const srcAttachment = isDepthStencil ? srcTarget->getDepthStencil() : srcTarget->getColor(0);
     run(srcAttachment.texture, srcAttachment.level, srcAttachment.layer, x, y, width, height,
-            graphicsQueueFamilyIndex, std::move(pbd), selectMemoryFunc, readCompleteFunc);
+            std::move(pbd));
 }
 
 void VulkanReadPixels::run(fvkmemory::resource_ptr<VulkanTexture> srcTexture, uint8_t level,
         uint16_t layer, uint32_t x, uint32_t y, uint32_t width, uint32_t height,
-        uint32_t graphicsQueueFamilyIndex, PixelBufferDescriptor&& pbd,
-        SelecteMemoryFunction const& selectMemoryFunc,
-        OnReadCompleteFunction const& readCompleteFunc) {
+        PixelBufferDescriptor&& pbd) {
     assert_invariant(mDevice != VK_NULL_HANDLE);
     assert_invariant(srcTexture);
 
-    VkDevice& device = mDevice;
+    VkDevice device = mDevice;
 
     if (mCommandPool == VK_NULL_HANDLE) {
         // Create a command pool if one has not been created.
         VkCommandPoolCreateInfo createInfo = {
-                .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-                .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
-                         | VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
-                .queueFamilyIndex = graphicsQueueFamilyIndex,
+            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT |
+                     VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+            .queueFamilyIndex = mGraphicsQueueFamilyIndex,
         };
         vkCreateCommandPool(device, &createInfo, VKALLOC, &mCommandPool);
     }
@@ -161,7 +188,9 @@ void VulkanReadPixels::run(fvkmemory::resource_ptr<VulkanTexture> srcTexture, ui
         mTaskHandler = std::make_unique<TaskHandler>();
     }
 
-    VkCommandPool const cmdpool = mCommandPool;
+    // We're about to allocate from the command pool, which is a good time to release the command
+    // buffers (and the other resources) of the requests that completed since the last call.
+    gc();
 
     VkFormat const srcFormat = srcTexture->getVkFormat();
     VkImageAspectFlags const aspectMask = fvkutils::getImageAspect(srcFormat);
@@ -242,8 +271,8 @@ void VulkanReadPixels::run(fvkmemory::resource_ptr<VulkanTexture> srcTexture, ui
         .size = stagingSize,
         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
     };
-    // TODO: we could use a staging buffer pool, but this is on another thread.  We'd need to
-    // have a separate pool, or make our backend-thread one thread-safe.
+    // TODO: we could now allocate from VulkanStagePool/VulkanBufferCache: the staging buffer is
+    // created and destroyed on the backend thread, the handler thread only maps it.
     vkCreateBuffer(device, &bufferInfo, VKALLOC, &stagingBuffer);
     vkGetBufferMemoryRequirements(device, stagingBuffer, &memReqs);
 
@@ -255,15 +284,15 @@ void VulkanReadPixels::run(fvkmemory::resource_ptr<VulkanTexture> srcTexture, ui
 
     VkDeviceMemory stagingMemory;
 
-    uint32_t memoryTypeIndex = selectMemoryFunc(memReqs.memoryTypeBits,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
-                    | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    uint32_t memoryTypeIndex = mContext.selectMemoryType(memReqs.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                    VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
     bool hostCachedStaging = true;
 
     // If VK_MEMORY_PROPERTY_HOST_CACHED_BIT is not supported, we try only
     // HOST_VISIBLE+HOST_COHERENT.  HOST_CACHED helps a lot with readpixels performance.
     if (memoryTypeIndex >= VK_MAX_MEMORY_TYPES) {
-        memoryTypeIndex = selectMemoryFunc(memReqs.memoryTypeBits,
+        memoryTypeIndex = mContext.selectMemoryType(memReqs.memoryTypeBits,
                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         hostCachedStaging = false;
         FVK_LOGW << "readPixels: VK_MEMORY_PROPERTY_HOST_CACHED_BIT is not available; "
@@ -285,7 +314,7 @@ void VulkanReadPixels::run(fvkmemory::resource_ptr<VulkanTexture> srcTexture, ui
     VkCommandBuffer cmdbuffer;
     VkCommandBufferAllocateInfo const allocateInfo = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .commandPool = cmdpool,
+        .commandPool = mCommandPool,
         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
         .commandBufferCount = 1,
     };
@@ -341,7 +370,7 @@ void VulkanReadPixels::run(fvkmemory::resource_ptr<VulkanTexture> srcTexture, ui
     vkEndCommandBuffer(cmdbuffer);
 
     VkQueue queue;
-    vkGetDeviceQueue(device, graphicsQueueFamilyIndex, 0, &queue);
+    vkGetDeviceQueue(device, mGraphicsQueueFamilyIndex, 0, &queue);
     VkFence readCompleteFence;
     VkFenceCreateInfo const fenceCreateInfo{
             .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
@@ -359,67 +388,67 @@ void VulkanReadPixels::run(fvkmemory::resource_ptr<VulkanTexture> srcTexture, ui
     };
     vkQueueSubmit(queue, 1, &submitInfo, readCompleteFence);
 
-    auto* const pUserBuffer = new PixelBufferDescriptor(std::move(pbd));
-    auto cleanPbdFunc = [pUserBuffer, readCompleteFunc]() {
-        PixelBufferDescriptor& p = *pUserBuffer;
-        readCompleteFunc(std::move(p));
-        delete pUserBuffer;
+    Request const request{
+        .stagingBuffer = stagingBuffer,
+        .stagingMemory = stagingMemory,
+        .fence = readCompleteFence,
+        .cmdbuffer = cmdbuffer,
     };
-    auto waitFenceFunc = [device, width, height, swizzle, stagingBuffer, stagingMemory, cmdpool,
-                                 cmdbuffer, pUserBuffer, bpp, componentType, componentCount,
-                                 hostCachedStaging, fence = readCompleteFence]() mutable {
-        VkResult status = vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
-        if (status != VK_SUCCESS) {
-            FVK_LOGE << "Failed to wait for readPixels fence";
-            vkDestroyBuffer(device, stagingBuffer, VKALLOC);
-            vkFreeMemory(device, stagingMemory, VKALLOC);
-            vkDestroyFence(device, fence, VKALLOC);
-            vkFreeCommandBuffers(device, cmdpool, 1, &cmdbuffer);
-            return;
+
+    // Note that the task owns `request` and `pbd`: whether or not it gets to run, it must give the
+    // resources back (to us, and to the client respectively).
+    mTaskHandler->post([this, device, width, height, swizzle, bpp, componentType, componentCount,
+                               hostCachedStaging, request,
+                               pbd = std::move(pbd)](bool const executed) mutable {
+        if (executed) {
+            VkResult const status = vkWaitForFences(device, 1, &request.fence, VK_TRUE, UINT64_MAX);
+            if (status != VK_SUCCESS) {
+                FVK_LOGE << "Failed to wait for readPixels fence";
+            } else {
+                // Map memory so that we can start copying from it.
+                uint8_t const* srcPixels;
+                vkMapMemory(device, request.stagingMemory, 0, VK_WHOLE_SIZE, 0,
+                        (void**) &srcPixels);
+
+                // If MSAA, MoltenVK returns samples in planar layout (Sample 0 is the first
+                // width * height pixels). So we can simply ask DataReshaper to read width * height
+                // elements with standard row pitch!
+                int const rowPitch = width * bpp;
+
+                // Without HOST_CACHED the mapping is uncached, and DataReshaper's per-texel loop
+                // turns every 2-4 byte load into its own memory transaction. Bounce the mapped
+                // range into cached heap memory with one bulk memcpy (which the CPU can issue as
+                // wide, streaming loads) and reshape from there; reshape only ever reads the first
+                // sample plane.
+                uint8_t const* reshapeSrc = srcPixels;
+                std::unique_ptr<uint8_t[]> cachedCopy;
+                if (!hostCachedStaging) {
+                    size_t const size = size_t(rowPitch) * height;
+                    cachedCopy = std::make_unique_for_overwrite<uint8_t[]>(size);
+                    memcpy(cachedCopy.get(), srcPixels, size);
+                    reshapeSrc = cachedCopy.get();
+                }
+                if (!DataReshaper::reshapeImage(&pbd, componentType, componentCount, reshapeSrc,
+                            rowPitch, static_cast<int>(width), static_cast<int>(height), swizzle)) {
+                    FVK_LOGE << "Unsupported PixelDataFormat or PixelDataType";
+                }
+
+                vkUnmapMemory(device, request.stagingMemory);
+            }
         }
 
-        PixelBufferDescriptor& p = *pUserBuffer;
+        // We're done with the Vulkan objects; the backend thread will destroy them in gc().
+        retire(request);
 
-        // Map memory so that we can start copying from it.
-        uint8_t const* srcPixels;
-        vkMapMemory(device, stagingMemory, 0, VK_WHOLE_SIZE, 0, (void**) &srcPixels);
-
-        // If MSAA, MoltenVK returns samples in planar layout (Sample 0 is the first width * height
-        // pixels). So we can simply ask DataReshaper to read width * height elements with standard
-        // row pitch!
-        int const rowPitch = width * bpp;
-
-        // Without HOST_CACHED the mapping is uncached, and DataReshaper's per-texel loop turns
-        // every 2-4 byte load into its own memory transaction. Bounce the mapped range into
-        // cached heap memory with one bulk memcpy (which the CPU can issue as wide, streaming
-        // loads) and reshape from there; reshape only ever reads the first sample plane.
-        uint8_t const* reshapeSrc = srcPixels;
-        std::unique_ptr<uint8_t[]> cachedCopy;
-        if (!hostCachedStaging) {
-            size_t const size = size_t(rowPitch) * height;
-            cachedCopy = std::make_unique_for_overwrite<uint8_t[]>(size);
-            memcpy(cachedCopy.get(), srcPixels, size);
-            reshapeSrc = cachedCopy.get();
-        }
-        if (!DataReshaper::reshapeImage(&p, componentType, componentCount, reshapeSrc,
-                    rowPitch, static_cast<int>(width), static_cast<int>(height), swizzle)) {
-            FVK_LOGE << "Unsupported PixelDataFormat or PixelDataType";
-        }
-
-        vkUnmapMemory(device, stagingMemory);
-        vkDestroyBuffer(device, stagingBuffer, VKALLOC);
-        vkFreeMemory(device, stagingMemory, VKALLOC);
-        vkDestroyFence(device, fence, VKALLOC);
-        vkFreeCommandBuffers(device, cmdpool, 1, &cmdbuffer);
-    };
-    mTaskHandler->post(std::move(waitFenceFunc), std::move(cleanPbdFunc));
+        mOnReadComplete(std::move(pbd));
+    });
 }
 
 void VulkanReadPixels::runUntilComplete() {
-    if (!mTaskHandler) {
-        return;
+    if (mTaskHandler) {
+        mTaskHandler->drain();
     }
-    mTaskHandler->drain();
+    gc();
 }
 
 }// namespace filament::backend

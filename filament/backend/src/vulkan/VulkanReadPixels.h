@@ -24,16 +24,21 @@
 #include <bluevk/BlueVK.h>
 
 #include <utils/Condition.h>
+#include <utils/Invocable.h>
 #include <utils/Mutex.h>
+#include <utils/compiler.h>
 
 #include <math/vec4.h>
 
 #include <functional>
+#include <memory>
 #include <queue>
 #include <thread>
+#include <vector>
 
 namespace filament::backend {
 
+struct VulkanContext;
 struct VulkanRenderTarget;
 struct VulkanTexture;
 
@@ -42,22 +47,21 @@ public:
     // A helper class that runs tasks on a separate thread.
     class TaskHandler {
     public:
-        using WorkloadFunc = std::function<void()>;
-        using OnCompleteFunc = std::function<void()>;
-        using Task = std::pair<WorkloadFunc, OnCompleteFunc>;
+        // A task is invoked with `executed = true` from the handler thread. If the handler is shut
+        // down before the task is picked up, the task is instead invoked with `executed = false` so
+        // that clients can still release whatever the task owns (the user's PixelBufferDescriptor
+        // and the Vulkan objects of the request).
+        using Task = utils::Invocable<void(bool executed)>;
 
         TaskHandler();
 
-        // In addition to the workload that the handler will call, client must also provide an
-        // oncomplete function that the handler will call either when the workload completes or when
-        // the handler is shutdown (so that we can clean-up even when the task was not carried out).
-        void post(WorkloadFunc&& workload, OnCompleteFunc&& oncomplete);
+        void post(Task&& task);
 
         // This will block until all of the tasks are done.
         void drain();
 
-        // This will quit without running the workloads, but oncomplete callbacks will still be
-        // called.
+        // This will quit without running the pending tasks, but they will still be invoked with
+        // `executed = false` so that they can clean up after themselves.
         void shutdown();
 
     private:
@@ -71,30 +75,55 @@ public:
     };
 
     using OnReadCompleteFunction = std::function<void(PixelBufferDescriptor&&)>;
-    using SelecteMemoryFunction = std::function<uint32_t(uint32_t, VkFlags)>;
 
-    explicit VulkanReadPixels(VkDevice device);
+    // `onReadComplete` is called (from the handler thread) to hand the pixel buffer back to the
+    // client once the readback completed - or was abandoned.
+    VulkanReadPixels(VkDevice device, VulkanContext const& context,
+            uint32_t graphicsQueueFamilyIndex, OnReadCompleteFunction&& onReadComplete);
 
+    // Must be called from the backend thread.
     void terminate() noexcept;
 
+    // Must be called from the backend thread.
     void run(fvkmemory::resource_ptr<VulkanRenderTarget> srcTarget, uint32_t x, uint32_t y,
-            uint32_t width, uint32_t height, uint32_t graphicsQueueFamilyIndex,
-            PixelBufferDescriptor&& pbd, SelecteMemoryFunction const& selectMemoryFunc,
-            OnReadCompleteFunction const& readCompleteFunc);
+            uint32_t width, uint32_t height, PixelBufferDescriptor&& pbd);
 
+    // Must be called from the backend thread.
     void run(fvkmemory::resource_ptr<VulkanTexture> srcTexture, uint8_t level, uint16_t layer,
-            uint32_t x, uint32_t y, uint32_t width, uint32_t height,
-            uint32_t graphicsQueueFamilyIndex, PixelBufferDescriptor&& pbd,
-            SelecteMemoryFunction const& selectMemoryFunc,
-            OnReadCompleteFunction const& readCompleteFunc);
+            uint32_t x, uint32_t y, uint32_t width, uint32_t height, PixelBufferDescriptor&& pbd);
 
-    // This method will block until all of the in-flight requests are complete.
+    // Destroys the Vulkan objects of the requests that the handler thread has retired. Must be
+    // called from the backend thread (see `Request`). This is cheap when there is nothing to
+    // collect, so it can be called every tick.
+    void gc();
+
+    // This method will block until all of the in-flight requests are complete, and collects their
+    // resources. Must be called from the backend thread.
     void runUntilComplete();
 
 private:
+    // The Vulkan objects backing a single readback. They are created on the backend thread and,
+    // because VkCommandPool is externally synchronized, they must also be destroyed on it: the
+    // handler thread hands them back via `retire()` and `gc()` destroys them.
+    struct Request {
+        VkBuffer stagingBuffer = VK_NULL_HANDLE;
+        VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        VkCommandBuffer cmdbuffer = VK_NULL_HANDLE;
+    };
+
+    // Called from the handler thread once it is done using the request's resources.
+    void retire(Request const& request);
+
     VkDevice mDevice = VK_NULL_HANDLE;
+    VulkanContext const& mContext;
+    uint32_t const mGraphicsQueueFamilyIndex;
+    OnReadCompleteFunction const mOnReadComplete;
     VkCommandPool mCommandPool = VK_NULL_HANDLE;
     std::unique_ptr<TaskHandler> mTaskHandler;
+
+    utils::Mutex mRetiredRequestsMutex;
+    std::vector<Request> mRetiredRequests UTILS_GUARDED_BY(mRetiredRequestsMutex);
 };
 
 }// namespace filament::backend

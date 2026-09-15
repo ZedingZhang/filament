@@ -265,7 +265,8 @@ VulkanDriver::VulkanDriver(VulkanPlatform* platform, VulkanContext& context,
           mYcbcrConversionCache(mPlatform->getDevice()),
           mSamplerCache(mPlatform->getDevice()),
           mBlitter(mPlatform->getPhysicalDevice(), &mCommands),
-          mReadPixels(mPlatform->getDevice()),
+          mReadPixels(mPlatform->getDevice(), mContext, mPlatform->getGraphicsQueueFamilyIndex(),
+                  [this](PixelBufferDescriptor&& pbd) { scheduleDestroy(std::move(pbd)); }),
           mDescriptorSetLayoutCache(mPlatform->getDevice(), &mResourceManager),
           mDescriptorSetCache(mPlatform->getDevice(), &mResourceManager),
           mQueryManager(mPlatform->getDevice()),
@@ -447,6 +448,9 @@ void VulkanDriver::terminate() {
 
 void VulkanDriver::tick(int) {
     mCommands.updateFences();
+
+    // Destroy the resources of the readbacks that completed on the readPixels thread.
+    mReadPixels.gc();
 
     if (getJobWorker()) {
         // This number is randomly/heuristically chosen. Consider making the number optional.
@@ -2532,13 +2536,7 @@ void VulkanDriver::readPixels(Handle<HwRenderTarget> src, uint32_t x, uint32_t y
         uint32_t height, PixelBufferDescriptor&& pbd) {
     auto srcTarget = resource_ptr<VulkanRenderTarget>::cast(&mResourceManager, src);
     endCommandRecording();
-    mReadPixels.run(
-            srcTarget, x, y, width, height, mPlatform->getGraphicsQueueFamilyIndex(),
-            std::move(pbd),
-            [&context = mContext](uint32_t types, VkFlags reqs) {
-                return context.selectMemoryType(types, reqs);
-            },
-            [this](PixelBufferDescriptor&& pbd) { scheduleDestroy(std::move(pbd)); });
+    mReadPixels.run(srcTarget, x, y, width, height, std::move(pbd));
 }
 
 void VulkanDriver::readTexture(Handle<HwTexture> src, uint8_t level, uint16_t layer, uint32_t x,
@@ -2549,13 +2547,7 @@ void VulkanDriver::readTexture(Handle<HwTexture> src, uint8_t level, uint16_t la
     assert_invariant(srcTexture->target != SamplerType::SAMPLER_3D);
 
     endCommandRecording();
-    mReadPixels.run(
-            srcTexture, level, layer, x, y, width, height, mPlatform->getGraphicsQueueFamilyIndex(),
-            std::move(pbd),
-            [&context = mContext](uint32_t types, VkFlags reqs) {
-                return context.selectMemoryType(types, reqs);
-            },
-            [this](PixelBufferDescriptor&& pbd) { scheduleDestroy(std::move(pbd)); });
+    mReadPixels.run(srcTexture, level, layer, x, y, width, height, std::move(pbd));
 }
 
 void VulkanDriver::readBufferSubData(backend::BufferObjectHandle boh,
